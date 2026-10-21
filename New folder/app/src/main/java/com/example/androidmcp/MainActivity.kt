@@ -5,7 +5,12 @@ import android.app.Activity
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Typeface
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -60,7 +65,8 @@ class MainActivity : Activity() {
             val perms = mutableListOf(
                 Manifest.permission.CALL_PHONE, Manifest.permission.ANSWER_PHONE_CALLS,
                 Manifest.permission.READ_PHONE_STATE, Manifest.permission.SEND_SMS,
-                Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION
+                Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.RECORD_AUDIO
             )
             if (Build.VERSION.SDK_INT >= 33) perms.add(Manifest.permission.POST_NOTIFICATIONS)
             requestPermissions(perms.toTypedArray(), 1)
@@ -93,7 +99,80 @@ class MainActivity : Activity() {
             status.postDelayed({ refresh() }, 500)
         }
 
+        val micResult = TextView(this).apply { textSize = 13f; setPadding(0, 24, 0, 24) }
+        button("Call test: can this phone hear a call? (tap during a call)") { runMicTest(micResult) }
+        col.addView(micResult)
+
         setContentView(ScrollView(this).apply { addView(col) })
+    }
+
+    /**
+     * During a phone call, records 5 seconds from each microphone source and reports whether
+     * real sound arrived or only silence (Android silences the mic for apps during calls on many phones).
+     */
+    private fun runMicTest(out: TextView) {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 2)
+            out.text = "Allow the microphone permission, then tap the test again."
+            return
+        }
+        out.text = "Testing for about 15 seconds. Keep the call on speaker and have the other person talk."
+        Thread {
+            val sources = listOf(
+                "MIC" to MediaRecorder.AudioSource.MIC,
+                "VOICE_RECOGNITION" to MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                "VOICE_COMMUNICATION" to MediaRecorder.AudioSource.VOICE_COMMUNICATION
+            )
+            val am = getSystemService(AudioManager::class.java)
+            val sb = StringBuilder()
+            sb.append("Audio mode: ${am.mode} (2 or 3 means a call is active, 0 means no call)\n")
+            sb.append("Android ${Build.VERSION.RELEASE}, ${Build.MANUFACTURER} ${Build.MODEL}\n\n")
+            for ((name, src) in sources) {
+                sb.append(name).append(": ").append(recordPeak(src)).append('\n')
+            }
+            sb.append("\nIf every source says SILENT while the other person was talking, this phone blocks call audio from apps.")
+            runOnUiThread { out.text = sb.toString() }
+        }.start()
+    }
+
+    private fun recordPeak(source: Int): String {
+        val rate = 16000
+        val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBuf <= 0) return "not supported"
+        val buf = ShortArray(maxOf(minBuf, rate) / 2)
+        val rec = try {
+            AudioRecord(source, rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, buf.size * 2)
+        } catch (t: Throwable) {
+            return "could not open (${t.message})"
+        }
+        if (rec.state != AudioRecord.STATE_INITIALIZED) {
+            rec.release()
+            return "could not open"
+        }
+        var peak = 0
+        var total = 0L
+        var samples = 0L
+        try {
+            rec.startRecording()
+            val end = System.currentTimeMillis() + 5000
+            while (System.currentTimeMillis() < end) {
+                val n = rec.read(buf, 0, buf.size)
+                if (n <= 0) continue
+                for (k in 0 until n) {
+                    val v = kotlin.math.abs(buf[k].toInt())
+                    if (v > peak) peak = v
+                    total += v
+                }
+                samples += n
+            }
+        } catch (t: Throwable) {
+            return "error (${t.message})"
+        } finally {
+            try { rec.stop() } catch (_: Throwable) {}
+            rec.release()
+        }
+        val avg = if (samples > 0) total / samples else 0
+        return if (peak < 5) "SILENT (peak $peak)" else "HEARD SOUND (peak $peak, average $avg)"
     }
 
     override fun onResume() {
